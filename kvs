@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+# vim: ft=python
+import gi
+gi.require_version("Gtk", "3.0")
+from gi.repository import Gtk
+from gi.repository import Gio
+from gi.repository import Gdk
+from sqlite3 import connect,Connection
+from pathlib import Path
+from os import walk
+from os.path import join
+from locale import getpreferredencoding as enc
+from re import compile as re
+from argparse import ArgumentParser
+from sys import exit
+
+args = ArgumentParser()
+args.add_argument("--key")
+args.add_argument("--value")
+
+argument_namespace,fakeargv = args.parse_known_args()
+globals().update(argument_namespace.__dict__)
+
+
+CONFIG_PATH = Path.home() / ".config" / "kvs"
+if not CONFIG_PATH.is_dir() and CONFIG_PATH.parent.is_dir():
+    CONFIG_PATH.mkdir()
+DB_NAME = str(Path.home() / ".config" / "kvs"/ "kvs_11.sdlitedb")
+
+
+schema =  """
+create table if not exists kvs (
+id integer primary key,
+key text,
+val text,
+unique(key) on conflict replace);
+"""
+
+
+class Db(Connection):
+    def __init__(self,name,**kwargs):
+        super().__init__(name,**kwargs)
+        self.cu = self.cursor()
+        self.cu.row_factory = lambda c,r:r[0]
+        made = bool(self.cu.execute("select * from sqlite_master").fetchone())
+        if not made:
+            self.executescript(schema)
+            self.commit()
+
+
+cx = connect(DB_NAME,factory=Db)
+
+if key and value:
+    rowid = cx.execute("insert into kvs (key,val) values (?,?)",
+                       (key,value)).lastrowid
+    cx.commit()
+    exit()
+elif key:
+    print(cx.cu.execute("select val from kvs where key=?",(key,)).fetchone())
+    exit()
+
+
+def files_in_path_recursive(path):
+    for r,ds,fs in walk(str(path)):
+        for ff in fs:
+            yield Path(join(r,ff))
+
+def files_in_selection(selection,recursive=True):
+    is_uri = re("file://").match
+    for p in (
+        Path(f).resolve()
+        for f in (
+            u[7:] for u in filter(
+                is_uri,
+                selection.get_data().decode(
+                    encoding=enc()
+                ).splitlines()))):
+        if p.is_dir() and recursive:
+            yield from files_in_path_recursive(p)
+        elif p.is_file():
+            yield p
+
+
+class TreeFrame(Gtk.Frame):
+
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.sel_idx = -1
+        self.iter_x = None
+        self.store = Gtk.ListStore(int,str,str)
+        self.set_label("")
+        self.box = Gtk.Box(orientation=1,spacing=10)
+        self.add(self.box)
+        self.scrollwin = Gtk.ScrolledWindow()
+        self.scrollwin.set_vexpand(True)
+        self.tree = Gtk.TreeView(model=self.store)
+        self.scrollwin.add(self.tree)
+        self.tree.set_border_width(3)
+        self.tree.connect("row-activated",self.row_activate)
+        self.tree.get_selection().connect("changed",self.row_selection_changed)
+        for idx,colname in enumerate("id key val".split()):
+            renderer = Gtk.CellRendererText()
+            col = Gtk.TreeViewColumn(colname,renderer,text=idx)
+            self.tree.append_column(col)
+        self.tree.get_columns()[0].set_visible(False)
+        self.inspector = Inspector(self)
+        self.box.add(self.scrollwin)
+        self.box.add(self.inspector)
+
+    def row_activate(self,*args):
+        self.inspector.entry.grab_focus()
+
+    def row_selection_changed(self,treesel):
+        store,iterx = treesel.get_selected()
+        if not iterx:
+            return
+        oid,key,val = (
+            store.get_value(iterx,0),
+            store.get_value(iterx,1),
+            store.get_value(iterx,2))
+        self.sel_idx = oid
+        self.set_label(key)
+        self.inspector.set_label(key)
+        self.inspector.label.set_label(val)
+        self.inspector.entry.set_text(val)
+        self.iter_x = iterx
+
+    def refresh_store(self):
+        store = self.tree.get_model()
+        store.clear()
+        for oid,key,val in cx.execute(
+                "select id,key,val from kvs"):
+            store.append([oid,key,val])
+
+    def add_files_as_keys(self,path_or_pathlist,recursive=True,include_pattern=None,exclude_pattern=None):
+        print("include_pattern:",include_pattern)
+        print("exclude_pattern:",exclude_pattern)
+        store = self.tree.get_model()
+        rowid = -1
+        pathlist = []
+        if isinstance(path_or_pathlist,Path) and path_or_pathlist.is_dir():
+            if recursive:
+                pathlist = list(files_in_path_recursive(path_or_pathlist))
+            else:
+                pathlist = [p
+                            for p in path_or_pathlist.iterdir()
+                            if p.is_file()]
+        elif isinstance(path_or_pathlist,list):
+            pathlist = path_or_pathlist
+        else:
+            raise NotImplementedError
+        for p in pathlist:
+            if p.is_file():
+                key = str(p)
+                val = p.name
+                rowid = cx.execute(
+                    "insert into kvs (key,val) values (?,?)",
+                    (key,val)).lastrowid
+            elif p.is_dir():
+                print("p:",p)
+        if rowid > -1:
+            cx.commit()
+            self.refresh_store()
+
+    def delete_selected(self,button):
+        sel = self.tree.get_selection()
+        store,iterx = sel.get_selected()
+        if not iterx:
+            return
+        oid = store.get_value(iterx,0)
+        cx.execute("delete from kvs where id=?",(oid,))
+        cx.commit()
+        store.remove(iterx)
+        self.iter_x = None
+
+
+class Inspector(Gtk.Frame):
+
+    def __init__(self,master,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.master = master
+        self.box = Gtk.Box(orientation=1,spacing=10)
+        self.label = Gtk.Label()
+        self.entry = Gtk.Entry()
+        self.entry.connect("activate",self.entry_func)
+        self.box.add(self.label)
+        self.box.add(self.entry)
+        self.add(self.box)
+
+    def entry_func(self,entry):
+        if (self.master.sel_idx > -1) and self.master.iter_x:
+            txt = entry.get_text()
+            cx.execute(
+                "update kvs set val=? where id=?",
+                (txt,self.master.sel_idx))
+            cx.commit()
+            store = self.master.tree.get_model()
+            store.set_value(self.master.iter_x,2,txt)
+            self.label.set_label(txt)
+            self.master.tree.grab_focus()
+
+
+class Win(Gtk.ApplicationWindow):
+    @property
+    def include_filter_pattern(self):
+        return self.filter_entry_include.get_text()
+    @property
+    def exclude_filter_pattern(self):
+        return self.filter_entry_exclude.get_text()
+    @property
+    def recurse(self):
+        return self.checkbutton_recursive.get_active()
+
+    def __init__(self,*args,**kwargs):
+        super().__init__(*args,**kwargs)
+        self.headerbar = Gtk.HeaderBar()
+        self.headerbar.set_title("Hello World!")
+        self.headerbar.set_show_close_button(True)
+        self.set_titlebar(self.headerbar)
+        self.box = Gtk.Box(orientation=1,spacing=10)
+        self.box.set_border_width(24)
+        self.add(self.box)
+        self.toolbar = Gtk.Toolbar()
+        self.box.add(self.toolbar)
+        self.toolbar_addbtn_img = Gtk.Image.new_from_icon_name("folder-new",0)
+        self.toolbar_addbtn = Gtk.ToolButton.new(self.toolbar_addbtn_img)
+        self.toolbar_addbtn.connect("clicked",self.toolbar_addbtn_clicked)
+        self.toolbar_filter_entry_include = Gtk.ToolItem.new()
+        self.toolbar_filter_entry_exclude = Gtk.ToolItem.new()
+        self.filter_entry_include = Gtk.Entry()
+        self.filter_entry_include.set_placeholder_text("/include/")
+        self.filter_entry_exclude = Gtk.Entry()
+        self.filter_entry_exclude.set_placeholder_text("/exclude/")
+        self.toolbar_filter_entry_include.add(self.filter_entry_include)
+        self.toolbar_filter_entry_exclude.add(self.filter_entry_exclude)
+        self.toolbar_chkbox = Gtk.ToolItem.new()
+        self.checkbutton_recursive = Gtk.CheckButton()
+        self.checkbutton_recursive.set_label("add recursively")
+        self.toolbar_chkbox.add(self.checkbutton_recursive)
+        self.toolbar_sep1 = Gtk.ToolItem.new()
+        self.toolbar_sep1.props.margin_end = 20
+        self.toolbar_sep1.props.margin_start = 20
+        self.toolbar_sep1.add(Gtk.Separator())
+        self.entry_k = Gtk.Entry()
+        self.entry_v = Gtk.Entry()
+        self.entry_k.set_placeholder_text("key")
+        self.entry_v.set_placeholder_text("value")
+        self.entry_k.connect("activate",self.evaluate_toolbar_entries)
+        self.entry_v.connect("activate",self.evaluate_toolbar_entries)
+        self.toolbar_entry_k = Gtk.ToolItem.new()
+        self.toolbar_entry_v = Gtk.ToolItem.new()
+        self.toolbar_entry_k.add(self.entry_k)
+        self.toolbar_entry_v.add(self.entry_v)
+        self.toolbar.add(self.toolbar_addbtn)
+        self.toolbar.add(self.toolbar_filter_entry_include)
+        self.toolbar.add(self.toolbar_filter_entry_exclude)
+        self.toolbar.add(self.toolbar_chkbox)
+
+        self.toolbar.add(self.toolbar_sep1)
+
+        self.toolbar.add(self.toolbar_entry_k)
+        self.toolbar.add(self.toolbar_entry_v)
+        self.treeframe = TreeFrame()
+        self.box.add(self.treeframe)
+        self.drag_dest_set(
+            Gtk.DestDefaults.MOTION|
+            Gtk.DestDefaults.HIGHLIGHT|
+            Gtk.DestDefaults.DROP,
+            [Gtk.TargetEntry.new("text/uri-list", 0, 80)], Gdk.DragAction.COPY)
+        self.set_default_size(1920,768)
+        self.treeframe.refresh_store()
+        self.connect("drag-motion",self.drag_motion)
+        self.connect("drag-data-received",self.receive_dropped_uris)
+        self.show_all()
+
+    def receive_dropped_uris(self,widget,context,x,y,selection,target_type,ts):
+        files = list(files_in_selection(selection,recursive=self.recurse))
+        self.treeframe.add_files_as_keys(files)
+        self.treeframe.drag_unhighlight()
+        self.treeframe.queue_draw()
+        context.finish(True,False,ts)
+
+
+    def drag_motion(self,widget,context,x,y,ts):
+        self.treeframe.drag_highlight()
+        self.treeframe.queue_draw()
+        return True
+
+    def evaluate_toolbar_entries(self,entry):
+        k = self.entry_k.get_text()
+        v = self.entry_v.get_text()
+        print("k,v:",k,v)
+        if k:
+            rowid = cx.execute("insert into kvs (key,val) values (?,?)",
+                               (k,v)).lastrowid
+            print("rowid:",rowid)
+            cx.commit()
+            self.treeframe.refresh_store()
+
+    def toolbar_addbtn_clicked(self,*args):
+        dialog = Gtk.FileChooserDialog(
+            title="foo",
+            action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,Gtk.ResponseType.CANCEL,
+            "Select",Gtk.ResponseType.OK)
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            foldername = dialog.get_filename()
+            path = Path(foldername)
+            self.treeframe.add_files_as_keys(path,recursive=self.recurse)
+        dialog.destroy()
+
+
+
+class App(Gtk.Application):
+
+    def on_quit(self,action,param):
+        self.quit()
+
+    def on_info(self,action,param):
+        self.about.show()
+
+    def on_folder_open(self,action,param):
+        dialog = Gtk.FileChooserDialog(
+            title="foo",
+            action=Gtk.FileChooserAction.SELECT_FOLDER)
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,Gtk.ResponseType.CANCEL,
+            "Select",Gtk.ResponseType.OK)
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            foldername = dialog.get_filename()
+            path = Path(foldername)
+            self.window.treeframe.add_files_as_keys(path,recursive=self.window.recurse)
+        dialog.destroy()
+
+    def dialog_response(self,dialog,response):
+        dialog.hide()
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        actiondata = (
+            ("quit",self.on_quit),
+            ("info",self.on_info),
+            ("folderopen",self.on_folder_open))
+        for name,callback in actiondata:
+            action = Gio.SimpleAction.new(name,None)
+            action.connect("activate",callback)
+            self.add_action(action)
+        appmenu_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <interface>
+        <menu id="app-menu">
+        <section>
+            <item>
+                <attribute name="action">app.info</attribute>
+                <attribute name="label" translatable="yes">_Info</attribute>
+                <attribute name="accel">&lt;Primary&gt;i</attribute>
+            </item>
+            <item>
+                <attribute name="action">app.quit</attribute>
+                <attribute name="label" translatable="yes">_Quit</attribute>
+                <attribute name="accel">&lt;Primary&gt;q</attribute>
+            </item>
+        </section>
+        </menu>
+        </interface>"""
+        menu_xml = """<?xml version="1.0" encoding="UTF-8"?>
+        <interface>
+        <menu id="menu">
+        <submenu>
+            <attribute name="label">Menu</attribute>
+            <section>
+                <item>
+                    <attribute name="action">app.info</attribute>
+                    <attribute name="label" translatable="yes">_Info</attribute>
+                    <attribute name="accel">&lt;Primary&gt;i</attribute>
+                </item>
+                <item>
+                    <attribute name="action">app.quit</attribute>
+                    <attribute name="label" translatable="yes">_Quit</attribute>
+                    <attribute name="accel">&lt;Primary&gt;q</attribute>
+                </item>
+            </section>
+        </submenu>
+        <submenu>
+            <attribute name="label">File</attribute>
+            <section>
+                <item>
+                    <attribute name="action">app.folderopen</attribute>
+                    <attribute name="label" translatable="yes">Fol_der</attribute>
+                    <attribute name="accel">&lt;Primary&gt;d</attribute>
+                </item>
+            </section>
+        </submenu>
+        </menu>
+        </interface>"""
+
+        # builder = Gtk.Builder.new_from_file("appmenu.xml")
+        appmenu_builder = Gtk.Builder.new_from_string(appmenu_xml,-1)
+        # builder = Gtk.Builder.new_from_file("menu.xml")
+        menu_builder = Gtk.Builder.new_from_string(menu_xml,-1)
+
+        self.set_app_menu(appmenu_builder.get_object("app-menu"))
+        self.set_menubar(menu_builder.get_object("menu"))
+        self.about = Gtk.AboutDialog()
+        self.about.connect("response",self.dialog_response)
+
+    def do_activate(self):
+        self.window = Win(application=self,title="Hello World!")
+        self.window.present()
+
+
+if __name__ == "__main__":
+    app = App(application_id="org.dust.hello_9001")
+    app.run(fakeargv)
+
